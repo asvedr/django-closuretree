@@ -27,7 +27,7 @@
 # pylint: disable=R0904
 
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import models
+from django.db import models, connection
 from django.db.models.base import ModelBase
 from django.db.models.signals import pre_save, post_save, pre_delete
 from django.dispatch import receiver
@@ -201,7 +201,42 @@ class ClosureModel(with_metaclass(ClosureModelBase, models.Model)):
         return result
 
     def _closure_createlink(self):
-        self._default_manager.closure_createlink(self.pk, self._closure_parent_pk)
+        pk = self.pk
+        parent_id = self._closure_parent_pk
+        closure_table = self._closure_model._meta.db_table
+        selects = ["SELECT 0, %s, %s"]
+        query_args = [pk, pk]
+        if parent_id:
+            template = ("SELECT depth + 1, %s, parent_id "
+                        "FROM {table} WHERE child_id = %s")
+            selects.append(template.format(table=closure_table))
+            query_args.extend([pk, parent_id])
+        if isinstance(pk, uuid.UUID):
+            query_args = map(unicode, query_args)
+
+        insert_template = (
+            "{insert_operator} INTO {closure_table} (depth, child_id, parent_id) {selects_union} {on_conflict}"
+        )
+        on_conflict_clause = ''
+
+        if connection.vendor == 'sqlite':
+            insert_operator = 'INSERT OR IGNORE'
+        elif connection.vendor == 'mysql':
+            insert_operator = 'INSERT IGNORE'
+        elif connection.vendor == 'postgresql':
+            insert_operator = 'INSERT'
+            on_conflict_clause = 'ON CONFLICT DO NOTHING'
+        else:
+            insert_operator = 'INSERT'
+
+        query_sql = insert_template.format(
+            insert_operator=insert_operator,
+            on_conflict=on_conflict_clause,
+            closure_table=closure_table,
+            selects_union=' UNION '.join(selects),
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(query_sql, query_args)
 
     def get_ancestors(self, include_self=False, depth=None):
         """Return all the ancestors of this object."""
@@ -295,6 +330,21 @@ class ClosureModel(with_metaclass(ClosureModelBase, models.Model)):
         """Part of the change detection. Have we changed since we began?"""
         return hasattr(self,"_closure_old_parent")
 
+    def _closure_update_links(self):
+        new_parent = self._closure_parent
+        old_parent = self._closure_old_parent
+        subtree_with_self = self.get_descendants(include_self=True)
+        subtree_without_self = self.get_descendants().order_by('level')
+        cached_subtree = [self] + list(subtree_without_self)
+        new_level = new_parent.level if new_parent is not None else 0
+        old_level = old_parent.level if old_parent is not None else 0
+        leveldiff = new_level - old_level
+        subtree_without_self.update(level=F('level') + leveldiff)
+        links = self._closure_model.objects.filter(child_id__in=subtree_with_self)
+        links.delete()
+        for item in cached_subtree:
+            item._closure_createlink()
+
 
 @receiver(pre_save, dispatch_uid='closure-model-presave')
 def closure_model_set_level(sender, **kwargs):
@@ -314,9 +364,7 @@ def closure_model_save(sender, **kwargs):
         create = kwargs['created']
         if instance._closure_change_check():
             # Changed parents
-            instance._default_manager.closure_update_links(
-                instance, instance._closure_parent, instance._closure_old_parent
-            )
+            instance._closure_update_links()
             delattr(instance, "_closure_old_parent")
         elif create:
             # We still need to create links when we're first made
