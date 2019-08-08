@@ -34,6 +34,7 @@ from django.dispatch import receiver
 from django.utils.six import with_metaclass
 from . import managers
 import sys
+import uuid
 
 
 def _closure_model_unicode(self):
