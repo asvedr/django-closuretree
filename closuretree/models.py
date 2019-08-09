@@ -28,6 +28,7 @@
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models, connection
+from django.db.models import F
 from django.db.models.base import ModelBase
 from django.db.models.signals import pre_save, post_save, pre_delete
 from django.dispatch import receiver
